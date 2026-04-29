@@ -266,6 +266,6 @@ const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`📊 Health check: https://ocean-qr-backend.onrender.com/health`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
