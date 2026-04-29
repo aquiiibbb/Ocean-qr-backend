@@ -25,56 +25,38 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 
-// MongoDB Connection with aggressive timeout settings
+// MongoDB Connection
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://nitinshaukia_db_user:MKQwGJeaTbyUO5EO@cluster0.uxmmhrg.mongodb.net/feedbackDB?retryWrites=true&w=majority";
 
-// Disconnect any existing connections
-mongoose.disconnect();
+console.log("🔗 Connecting to MongoDB...");
+console.log("📍 URI (masked):", MONGODB_URI.replace(/\/\/.*@/, '//***:***@'));
 
-const connectDB = async () => {
-  try {
-    // Close any existing connections first
-    if (mongoose.connection.readyState !== 0) {
-      await mongoose.disconnect();
-    }
+// Simple connection without complex retry logic
+mongoose.connect(MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+.then(() => {
+  console.log("✅ MongoDB connected successfully");
+})
+.catch((err) => {
+  console.error("❌ MongoDB connection failed:", err.message);
+});
 
-    await mongoose.connect(MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      serverSelectionTimeoutMS: 60000, // 60 seconds
-      socketTimeoutMS: 60000, // 60 seconds
-      connectTimeoutMS: 60000, // 60 seconds
-      bufferMaxEntries: 0, // Disable mongoose buffering
-      bufferCommands: false, // Disable mongoose buffering
-      maxPoolSize: 5, // Limit connection pool
-      minPoolSize: 1,
-      maxIdleTimeMS: 30000,
-      heartbeatFrequencyMS: 10000,
-    });
+// Connection event handlers
+mongoose.connection.on('connected', () => {
+  console.log('✅ Mongoose connected to MongoDB');
+});
 
-    console.log("✅ MongoDB connected successfully");
-  } catch (err) {
-    console.error("❌ MongoDB connection failed:", err);
-    // Don't retry automatically in production
-    if (process.env.NODE_ENV !== 'production') {
-      setTimeout(connectDB, 5000);
-    }
-  }
-};
-
-// Connect to database
-connectDB();
-
-// Handle connection events
 mongoose.connection.on('error', (err) => {
-  console.error('❌ MongoDB connection error:', err);
+  console.error('❌ Mongoose connection error:', err);
 });
 
 mongoose.connection.on('disconnected', () => {
-  console.log('⚠️ MongoDB disconnected');
+  console.log('⚠️ Mongoose disconnected');
 });
 
-// Schema with indexes
+// Schema
 const FeedbackSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -110,52 +92,62 @@ const FeedbackSchema = new mongoose.Schema({
   }
 });
 
-// Add indexes for better performance
-FeedbackSchema.index({ date: -1 });
-FeedbackSchema.index({ rating: 1 });
-
 const Feedback = mongoose.model("Feedback", FeedbackSchema);
 
 // Root endpoint
 app.get("/", (req, res) => {
+  const dbState = mongoose.connection.readyState;
+  const dbStatus = {
+    0: "disconnected",
+    1: "connected", 
+    2: "connecting",
+    3: "disconnecting"
+  };
+
   res.json({
     success: true,
     message: "Ocean Paradise Feedback API",
     version: "1.0.0",
     status: "running",
-    database: mongoose.connection.readyState === 1 ? "connected" : "disconnected"
+    database: dbStatus[dbState] || "unknown",
+    dbState: dbState
   });
 });
 
 // Health check endpoint
 app.get("/health", (req, res) => {
+  const dbState = mongoose.connection.readyState;
+  const dbStatus = {
+    0: "disconnected",
+    1: "connected", 
+    2: "connecting",
+    3: "disconnecting"
+  };
+
   res.json({
     success: true,
     message: "Server is running",
     timestamp: new Date().toISOString(),
-    database: mongoose.connection.readyState === 1 ? "connected" : "disconnected"
+    database: dbStatus[dbState] || "unknown",
+    dbState: dbState,
+    mongooseVersion: mongoose.version
   });
 });
 
-// POST - Save Feedback with timeout protection
+// POST - Save Feedback
 app.post("/feedback", async (req, res) => {
   try {
     console.log("📥 Received feedback data:", JSON.stringify(req.body, null, 2));
+    console.log("🔍 DB State:", mongoose.connection.readyState);
 
-    // Check database connection first
+    // Check if database is connected
     if (mongoose.connection.readyState !== 1) {
-      console.log("❌ Database not connected, attempting reconnection...");
-      await connectDB();
-
-      // Wait a bit for connection to establish
-      await new Promise(resolve => setTimeout(resolve, 2000));
-
-      if (mongoose.connection.readyState !== 1) {
-        return res.status(503).json({
-          success: false,
-          error: "Database connection unavailable"
-        });
-      }
+      console.log("❌ Database not connected. State:", mongoose.connection.readyState);
+      return res.status(503).json({
+        success: false,
+        error: "Database connection unavailable. Please try again in a moment.",
+        dbState: mongoose.connection.readyState
+      });
     }
 
     const { name, email, phone, rating, message } = req.body;
@@ -198,15 +190,9 @@ app.post("/feedback", async (req, res) => {
       message: message ? String(message).trim() : "No message provided"
     };
 
-    console.log("💾 Saving to database:", JSON.stringify(feedbackData, null, 2));
+    console.log("💾 Attempting to save to database...");
 
-    // Use Promise.race to implement timeout
-    const savePromise = Feedback.create(feedbackData);
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Database operation timeout')), 30000)
-    );
-
-    const feedback = await Promise.race([savePromise, timeoutPromise]);
+    const feedback = await Feedback.create(feedbackData);
 
     console.log("✅ Feedback saved successfully:", feedback._id);
 
@@ -227,19 +213,23 @@ app.post("/feedback", async (req, res) => {
   } catch (err) {
     console.error("❌ Error saving feedback:", err);
 
-    if (err.message === 'Database operation timeout') {
-      return res.status(408).json({
-        success: false,
-        error: "Database timeout - please try again in a moment"
-      });
-    }
-
     if (err.name === 'ValidationError') {
       const errors = Object.values(err.errors).map(e => e.message);
       return res.status(400).json({
         success: false,
         error: "Validation failed",
         details: errors
+      });
+    }
+
+    // Check if it's a connection error
+    if (err.message.includes('buffering timed out') || 
+        err.message.includes('connection') ||
+        err.name === 'MongoNetworkError') {
+      return res.status(503).json({
+        success: false,
+        error: "Database connection issue. Please try again.",
+        details: err.message
       });
     }
 
@@ -250,25 +240,29 @@ app.post("/feedback", async (req, res) => {
   }
 });
 
-// GET - Get All Feedback (Optimized)
+// GET - Get All Feedback
 app.get("/feedback", async (req, res) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        success: false,
+        error: "Database connection unavailable"
+      });
+    }
+
     const page = parseInt(req.query.page) || 1;
     const limit = Math.min(parseInt(req.query.limit) || 20, 100);
     const skip = (page - 1) * limit;
 
-    const ratingFilter = req.query.rating ? { rating: parseInt(req.query.rating) } : {};
-
-    const data = await Feedback.find(ratingFilter)
+    const data = await Feedback.find()
       .sort({ date: -1 })
       .skip(skip)
       .limit(limit)
-      .lean()
-      .maxTimeMS(30000);
+      .lean();
 
-    const total = await Feedback.countDocuments(ratingFilter);
+    const total = await Feedback.countDocuments();
 
-    console.log(`📊 Retrieved ${data.length} feedback entries (page ${page})`);
+    console.log(`📊 Retrieved ${data.length} feedback entries`);
 
     res.json({
       success: true,
@@ -280,14 +274,6 @@ app.get("/feedback", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Error fetching feedback:", err);
-
-    if (err.name === 'MongooseError' && err.message.includes('timeout')) {
-      return res.status(408).json({
-        success: false,
-        error: "Database timeout - please try again"
-      });
-    }
-
     res.status(500).json({
       success: false,
       error: "Server error: " + err.message
@@ -298,6 +284,13 @@ app.get("/feedback", async (req, res) => {
 // DELETE - Delete feedback by ID
 app.delete("/feedback/:id", async (req, res) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        success: false,
+        error: "Database connection unavailable"
+      });
+    }
+
     const { id } = req.params;
 
     if (!mongoose.Types.ObjectId.isValid(id)) {
@@ -307,9 +300,7 @@ app.delete("/feedback/:id", async (req, res) => {
       });
     }
 
-    console.log("🗑️ Deleting feedback with ID:", id);
-
-    const deleted = await Feedback.findByIdAndDelete(id).maxTimeMS(15000);
+    const deleted = await Feedback.findByIdAndDelete(id);
 
     if (!deleted) {
       return res.status(404).json({
@@ -318,7 +309,6 @@ app.delete("/feedback/:id", async (req, res) => {
       });
     }
 
-    console.log("✅ Feedback deleted successfully");
     res.json({
       success: true,
       message: "Feedback deleted successfully",
@@ -326,14 +316,6 @@ app.delete("/feedback/:id", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Delete error:", err);
-
-    if (err.name === 'MongooseError' && err.message.includes('timeout')) {
-      return res.status(408).json({
-        success: false,
-        error: "Delete operation timeout - please try again"
-      });
-    }
-
     res.status(500).json({
       success: false,
       error: "Server error: " + err.message
@@ -346,8 +328,7 @@ app.use("*", (req, res) => {
   res.status(404).json({
     success: false,
     error: "Endpoint not found",
-    path: req.originalUrl,
-    availableEndpoints: ["/", "/health", "/feedback"]
+    path: req.originalUrl
   });
 });
 
@@ -362,12 +343,10 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 5000;
 
-// Only listen in development
 if (process.env.NODE_ENV !== 'production') {
   app.listen(PORT, () => {
     console.log(`🚀 Server running on http://localhost:${PORT}`);
   });
 }
 
-// Export for Vercel
 module.exports = app;
