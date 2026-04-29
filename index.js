@@ -1,3 +1,6 @@
+// Fix for path resolution issues
+process.chdir(__dirname);
+
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
@@ -22,16 +25,31 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 
-// MongoDB Connection with environment variable support
+// MongoDB Connection with improved timeout settings
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://nitinshaukia_db_user:MKQwGJeaTbyUO5EO@cluster0.uxmmhrg.mongodb.net/feedbackDB?retryWrites=true&w=majority";
 
-mongoose.connect(MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-}).then(() => console.log("✅ MongoDB connected"))
-  .catch(err => console.error("❌ MongoDB error:", err));
+const connectDB = async () => {
+  try {
+    await mongoose.connect(MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 30000, // 30 seconds
+      socketTimeoutMS: 45000, // 45 seconds
+      bufferMaxEntries: 0,
+      maxPoolSize: 10, // Maintain up to 10 socket connections
+      minPoolSize: 5, // Maintain a minimum of 5 socket connections
+    });
+    console.log("✅ MongoDB connected");
+  } catch (err) {
+    console.error("❌ MongoDB connection failed:", err);
+    // Retry after 5 seconds
+    setTimeout(connectDB, 5000);
+  }
+};
 
-// Schema with better validation
+connectDB();
+
+// Schema with better validation and indexing
 const FeedbackSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -66,6 +84,11 @@ const FeedbackSchema = new mongoose.Schema({
     default: Date.now
   }
 });
+
+// Add indexes for better performance
+FeedbackSchema.index({ date: -1 }); // Index for sorting by date
+FeedbackSchema.index({ rating: 1 }); // Index for filtering by rating
+FeedbackSchema.index({ email: 1 }); // Index for email lookups
 
 const Feedback = mongoose.model("Feedback", FeedbackSchema);
 
@@ -181,20 +204,26 @@ app.post("/feedback", async (req, res) => {
   }
 });
 
-// GET - Get All Feedback
+// GET - Get All Feedback (Optimized)
 app.get("/feedback", async (req, res) => {
   try {
-    // Pagination support
+    // Pagination support with reasonable limits
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 100;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100); // Cap at 100
     const skip = (page - 1) * limit;
 
-    const data = await Feedback.find()
+    // Optional filtering by rating
+    const ratingFilter = req.query.rating ? { rating: parseInt(req.query.rating) } : {};
+
+    // Use lean() for faster queries and add timeout
+    const data = await Feedback.find(ratingFilter)
       .sort({ date: -1 })
       .skip(skip)
-      .limit(limit);
+      .limit(limit)
+      .lean() // Returns plain objects, faster
+      .maxTimeMS(20000); // 20 second timeout
 
-    const total = await Feedback.countDocuments();
+    const total = await Feedback.countDocuments(ratingFilter);
 
     console.log(`📊 Retrieved ${data.length} feedback entries (page ${page})`);
 
@@ -218,6 +247,14 @@ app.get("/feedback", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Error fetching feedback:", err);
+
+    if (err.name === 'MongooseError' && err.message.includes('timeout')) {
+      return res.status(408).json({
+        success: false,
+        error: "Database timeout - please try again or reduce the page size"
+      });
+    }
+
     res.status(500).json({
       success: false,
       error: "Server error: " + err.message
@@ -240,7 +277,7 @@ app.delete("/feedback/:id", async (req, res) => {
 
     console.log("🗑️ Deleting feedback with ID:", id);
 
-    const deleted = await Feedback.findByIdAndDelete(id);
+    const deleted = await Feedback.findByIdAndDelete(id).maxTimeMS(10000); // 10 second timeout
 
     if (!deleted) {
       return res.status(404).json({
@@ -257,6 +294,14 @@ app.delete("/feedback/:id", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Delete error:", err);
+
+    if (err.name === 'MongooseError' && err.message.includes('timeout')) {
+      return res.status(408).json({
+        success: false,
+        error: "Delete operation timeout - please try again"
+      });
+    }
+
     res.status(500).json({
       success: false,
       error: "Server error: " + err.message
@@ -281,6 +326,13 @@ app.use((err, req, res, next) => {
     success: false,
     error: "Internal server error"
   });
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('🛑 Shutting down gracefully...');
+  await mongoose.connection.close();
+  process.exit(0);
 });
 
 const PORT = process.env.PORT || 5000;
