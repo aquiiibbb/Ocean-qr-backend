@@ -1,32 +1,23 @@
 {
-  "name": "hotel-feedback-server",
+  "name": "ocean-qr-backend",
   "version": "1.0.0",
-  "description": "Hotel Feedback Backend API",
+  "description": "Ocean Paradise Feedback API",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "build": "echo 'No build step required'",
-    "vercel-build": "echo 'Build completed'"
+    "build": "npm install"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "mongoose": "^7.6.3"
+    "express": "^4.19.2",
+    "mongoose": "^8.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": "24.x"
-  },
-  "keywords": [
-    "hotel",
-    "feedback",
-    "api",
-    "express",
-    "mongodb"
-  ],
-  "author": "Nitin Shaukia",
-  "license": "MIT"
+    "node": "24.x",
+    "npm": ">=10.0.0"
+  }
 }
