@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "build": "echo 'No build step required'",
+    "vercel-build": "echo 'Build completed'"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -14,5 +16,17 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
-  }
+  },
+  "engines": {
+    "node": "18.x"
+  },
+  "keywords": [
+    "hotel",
+    "feedback",
+    "api",
+    "express",
+    "mongodb"
+  ],
+  "author": "Nitin Shaukia",
+  "license": "MIT"
 }
