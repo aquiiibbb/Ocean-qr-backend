@@ -7,14 +7,14 @@ const cors = require("cors");
 
 const app = express();
 
-// CORS configuration for your domains
+// CORS configuration
 const corsOptions = {
   origin: [
     'https://ocean-qr-dashboard.vercel.app',
     'https://oceanparradisefeedback.vercel.app',
     'http://localhost:3000',
     'http://localhost:3001',
-    'http://localhost:5173', // Vite dev server
+    'http://localhost:5173',
     'http://localhost:5174'
   ],
   credentials: true,
@@ -25,31 +25,56 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 
-// MongoDB Connection with improved timeout settings
+// MongoDB Connection with aggressive timeout settings
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://nitinshaukia_db_user:MKQwGJeaTbyUO5EO@cluster0.uxmmhrg.mongodb.net/feedbackDB?retryWrites=true&w=majority";
+
+// Disconnect any existing connections
+mongoose.disconnect();
 
 const connectDB = async () => {
   try {
+    // Close any existing connections first
+    if (mongoose.connection.readyState !== 0) {
+      await mongoose.disconnect();
+    }
+
     await mongoose.connect(MONGODB_URI, {
       useNewUrlParser: true,
       useUnifiedTopology: true,
-      serverSelectionTimeoutMS: 30000, // 30 seconds
-      socketTimeoutMS: 45000, // 45 seconds
-      bufferMaxEntries: 0,
-      maxPoolSize: 10, // Maintain up to 10 socket connections
-      minPoolSize: 5, // Maintain a minimum of 5 socket connections
+      serverSelectionTimeoutMS: 60000, // 60 seconds
+      socketTimeoutMS: 60000, // 60 seconds
+      connectTimeoutMS: 60000, // 60 seconds
+      bufferMaxEntries: 0, // Disable mongoose buffering
+      bufferCommands: false, // Disable mongoose buffering
+      maxPoolSize: 5, // Limit connection pool
+      minPoolSize: 1,
+      maxIdleTimeMS: 30000,
+      heartbeatFrequencyMS: 10000,
     });
-    console.log("✅ MongoDB connected");
+
+    console.log("✅ MongoDB connected successfully");
   } catch (err) {
     console.error("❌ MongoDB connection failed:", err);
-    // Retry after 5 seconds
-    setTimeout(connectDB, 5000);
+    // Don't retry automatically in production
+    if (process.env.NODE_ENV !== 'production') {
+      setTimeout(connectDB, 5000);
+    }
   }
 };
 
+// Connect to database
 connectDB();
 
-// Schema with better validation and indexing
+// Handle connection events
+mongoose.connection.on('error', (err) => {
+  console.error('❌ MongoDB connection error:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.log('⚠️ MongoDB disconnected');
+});
+
+// Schema with indexes
 const FeedbackSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -86,9 +111,8 @@ const FeedbackSchema = new mongoose.Schema({
 });
 
 // Add indexes for better performance
-FeedbackSchema.index({ date: -1 }); // Index for sorting by date
-FeedbackSchema.index({ rating: 1 }); // Index for filtering by rating
-FeedbackSchema.index({ email: 1 }); // Index for email lookups
+FeedbackSchema.index({ date: -1 });
+FeedbackSchema.index({ rating: 1 });
 
 const Feedback = mongoose.model("Feedback", FeedbackSchema);
 
@@ -99,14 +123,7 @@ app.get("/", (req, res) => {
     message: "Ocean Paradise Feedback API",
     version: "1.0.0",
     status: "running",
-    endpoints: {
-      health: "GET /health",
-      feedback: {
-        get: "GET /feedback",
-        post: "POST /feedback",
-        delete: "DELETE /feedback/:id"
-      }
-    }
+    database: mongoose.connection.readyState === 1 ? "connected" : "disconnected"
   });
 });
 
@@ -120,10 +137,26 @@ app.get("/health", (req, res) => {
   });
 });
 
-// POST - Save Feedback
+// POST - Save Feedback with timeout protection
 app.post("/feedback", async (req, res) => {
   try {
     console.log("📥 Received feedback data:", JSON.stringify(req.body, null, 2));
+
+    // Check database connection first
+    if (mongoose.connection.readyState !== 1) {
+      console.log("❌ Database not connected, attempting reconnection...");
+      await connectDB();
+
+      // Wait a bit for connection to establish
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      if (mongoose.connection.readyState !== 1) {
+        return res.status(503).json({
+          success: false,
+          error: "Database connection unavailable"
+        });
+      }
+    }
 
     const { name, email, phone, rating, message } = req.body;
 
@@ -167,7 +200,13 @@ app.post("/feedback", async (req, res) => {
 
     console.log("💾 Saving to database:", JSON.stringify(feedbackData, null, 2));
 
-    const feedback = await Feedback.create(feedbackData);
+    // Use Promise.race to implement timeout
+    const savePromise = Feedback.create(feedbackData);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Database operation timeout')), 30000)
+    );
+
+    const feedback = await Promise.race([savePromise, timeoutPromise]);
 
     console.log("✅ Feedback saved successfully:", feedback._id);
 
@@ -188,6 +227,13 @@ app.post("/feedback", async (req, res) => {
   } catch (err) {
     console.error("❌ Error saving feedback:", err);
 
+    if (err.message === 'Database operation timeout') {
+      return res.status(408).json({
+        success: false,
+        error: "Database timeout - please try again in a moment"
+      });
+    }
+
     if (err.name === 'ValidationError') {
       const errors = Object.values(err.errors).map(e => e.message);
       return res.status(400).json({
@@ -207,35 +253,22 @@ app.post("/feedback", async (req, res) => {
 // GET - Get All Feedback (Optimized)
 app.get("/feedback", async (req, res) => {
   try {
-    // Pagination support with reasonable limits
     const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 20, 100); // Cap at 100
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
     const skip = (page - 1) * limit;
 
-    // Optional filtering by rating
     const ratingFilter = req.query.rating ? { rating: parseInt(req.query.rating) } : {};
 
-    // Use lean() for faster queries and add timeout
     const data = await Feedback.find(ratingFilter)
       .sort({ date: -1 })
       .skip(skip)
       .limit(limit)
-      .lean() // Returns plain objects, faster
-      .maxTimeMS(20000); // 20 second timeout
+      .lean()
+      .maxTimeMS(30000);
 
     const total = await Feedback.countDocuments(ratingFilter);
 
     console.log(`📊 Retrieved ${data.length} feedback entries (page ${page})`);
-
-    // Log first entry for debugging (without sensitive data)
-    if (data.length > 0) {
-      console.log("Sample entry:", {
-        id: data[0]._id,
-        name: data[0].name,
-        rating: data[0].rating,
-        date: data[0].date
-      });
-    }
 
     res.json({
       success: true,
@@ -251,7 +284,7 @@ app.get("/feedback", async (req, res) => {
     if (err.name === 'MongooseError' && err.message.includes('timeout')) {
       return res.status(408).json({
         success: false,
-        error: "Database timeout - please try again or reduce the page size"
+        error: "Database timeout - please try again"
       });
     }
 
@@ -267,7 +300,6 @@ app.delete("/feedback/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Validate ObjectId
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({
         success: false,
@@ -277,7 +309,7 @@ app.delete("/feedback/:id", async (req, res) => {
 
     console.log("🗑️ Deleting feedback with ID:", id);
 
-    const deleted = await Feedback.findByIdAndDelete(id).maxTimeMS(10000); // 10 second timeout
+    const deleted = await Feedback.findByIdAndDelete(id).maxTimeMS(15000);
 
     if (!deleted) {
       return res.status(404).json({
@@ -309,7 +341,7 @@ app.delete("/feedback/:id", async (req, res) => {
   }
 });
 
-// 404 handler for unknown routes
+// 404 handler
 app.use("*", (req, res) => {
   res.status(404).json({
     success: false,
@@ -328,20 +360,12 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('🛑 Shutting down gracefully...');
-  await mongoose.connection.close();
-  process.exit(0);
-});
-
 const PORT = process.env.PORT || 5000;
 
-// Only listen in development (Vercel handles this in production)
+// Only listen in development
 if (process.env.NODE_ENV !== 'production') {
   app.listen(PORT, () => {
     console.log(`🚀 Server running on http://localhost:${PORT}`);
-    console.log(`📊 Dashboard: http://localhost:${PORT}/feedback`);
   });
 }
 
